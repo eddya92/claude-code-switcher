@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import sys
 import subprocess
@@ -59,9 +60,13 @@ def set_keychain_credentials(credentials: str) -> bool:
         ['security', 'delete-generic-password', '-l', KEYCHAIN_SERVICE],
         capture_output=True
     )
+    try:
+        username = os.getlogin()
+    except OSError:
+        username = os.environ.get('USER', 'user')
     result = subprocess.run(
         ['security', 'add-generic-password',
-         '-a', os.environ.get('USER', 'user'),
+         '-a', username,
          '-s', KEYCHAIN_SERVICE,
          '-w', credentials],
         capture_output=True, text=True
@@ -104,6 +109,17 @@ def delete_profile_credentials(email: str):
 
 # --- session helpers ---
 
+_SAFE_SESSION_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
+_VALID_EMAIL_RE  = re.compile(r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$')
+
+
+def _validate_session_id(session_id: str | None) -> str | None:
+    """Return session_id only if it contains safe characters, else None."""
+    if session_id and _SAFE_SESSION_RE.match(session_id):
+        return session_id
+    return None
+
+
 def project_dir_name(path: str) -> str:
     return path.replace('/', '-')
 
@@ -141,8 +157,14 @@ def get_last_session(project_path: str | None = None) -> dict | None:
 # --- profile file helpers ---
 
 def account_filename(email: str) -> Path:
+    if not _VALID_EMAIL_RE.match(email):
+        raise ValueError(f"Invalid email address: {email!r}")
     safe = email.replace('@', '_at_').replace('.', '_').replace('+', '_')
-    return ACCOUNTS_DIR / f"{safe}.json"
+    path = ACCOUNTS_DIR / f"{safe}.json"
+    # Guard against path traversal — ensure the resolved path stays inside ACCOUNTS_DIR
+    if ACCOUNTS_DIR not in path.resolve().parents and path.resolve() != path:
+        raise ValueError(f"Unsafe account path derived from email: {email!r}")
+    return path
 
 def list_saved_accounts():
     if not ACCOUNTS_DIR.exists():
@@ -271,15 +293,15 @@ def switch_to_account(profile: dict, no_window: bool = False, exec_mode: bool = 
     sessions = profile.get('sessions', {})
     cwd = os.getcwd()
     encoded = project_dir_name(cwd)
-    session_id = sessions.get(cwd) or sessions.get(encoded)
+    session_id = _validate_session_id(sessions.get(cwd) or sessions.get(encoded))
 
     # Fallback: use the most recently active session for this project
     if not session_id:
         last = get_last_session(cwd)
         if last:
-            session_id = last['session_id']
+            session_id = _validate_session_id(last['session_id'])
 
-    claude_cmd = f"claude --resume {session_id}" if session_id else "claude"
+    claude_cmd = f"claude --resume {shlex.quote(session_id)}" if session_id else "claude"
     claude_args = ['claude', '--resume', session_id] if session_id else ['claude']
 
     if exec_mode:

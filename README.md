@@ -60,6 +60,8 @@ claude-switch
 claude-switch                        Interactive switcher — switches and launches Claude here
 claude-switch --new-window           Switch and open Claude in a new terminal window
 claude-switch --no-window            Switch and print the command to run manually
+claude-switch usage                  Show token usage (current session + last 7 days)
+claude-switch statusline             Add usage bars to Claude Code (run once per machine)
 claude-switch save                   Save current account credentials as a profile
 claude-switch list                   List all saved profiles
 claude-switch use <email>            Switch non-interactively (launches in this terminal)

@@ -7,6 +7,7 @@ import re
 import shlex
 import sys
 import subprocess
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import time
 
@@ -177,6 +178,204 @@ def list_saved_accounts():
         except Exception:
             pass
     return sorted(accounts, key=lambda x: x.get('email', ''))
+
+USAGE_CACHE = SWITCHER_DIR / "usage_cache.json"
+USAGE_CACHE_TTL = 60  # 1 minute
+
+def fetch_live_usage() -> dict | None:
+    credentials = get_keychain_credentials()
+    if not credentials:
+        return None
+    try:
+        data = json.loads(credentials)
+        access_token = data.get('claudeAiOauth', {}).get('accessToken', '')
+    except Exception:
+        return None
+    if not access_token:
+        return None
+
+    # Return cached data if still fresh
+    try:
+        if USAGE_CACHE.exists():
+            cached = json.loads(USAGE_CACHE.read_text())
+            if time.time() - cached.get('_cached_at', 0) < USAGE_CACHE_TTL:
+                return cached
+    except Exception:
+        pass
+
+    import urllib.request, urllib.error
+    req = urllib.request.Request(
+        'https://api.anthropic.com/api/oauth/usage',
+        headers={
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'claude-code/2.1.117',
+            'anthropic-beta': 'oauth-2025-04-20',
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            result = json.loads(r.read().decode())
+            result['_cached_at'] = time.time()
+            try:
+                USAGE_CACHE.write_text(json.dumps(result))
+                USAGE_CACHE.chmod(0o600)
+            except Exception:
+                pass
+            return result
+    except Exception:
+        # Fall back to stale cache if available
+        try:
+            if USAGE_CACHE.exists():
+                return json.loads(USAGE_CACHE.read_text())
+        except Exception:
+            pass
+        return None
+
+def format_reset_time(resets_at: str | None) -> str:
+    if not resets_at:
+        return ''
+    try:
+        dt = datetime.fromisoformat(resets_at.replace('Z', '+00:00'))
+        local = dt.astimezone()
+        now = datetime.now(local.tzinfo)
+        if local.date() == now.date():
+            return local.strftime('Resets %I:%M%p').replace(' 0', ' ').lower()
+        return local.strftime(f'Resets %b %-d at %I:%M%p').replace(' 0', ' ').lower()
+    except Exception:
+        return ''
+
+def render_bar(pct: float, width: int = 50) -> str:
+    filled = int(round(pct / 100 * width))
+    filled = max(0, min(filled, width))
+    bar = '█' * filled + '░' * (width - filled)
+    return bar
+
+def fetch_live_usage_nocache() -> dict | None:
+    credentials = get_keychain_credentials()
+    if not credentials:
+        return None
+    try:
+        data = json.loads(credentials)
+        access_token = data.get('claudeAiOauth', {}).get('accessToken', '')
+    except Exception:
+        return None
+    if not access_token:
+        return None
+
+    import urllib.request, urllib.error
+    req = urllib.request.Request(
+        'https://api.anthropic.com/api/oauth/usage',
+        headers={
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'claude-code/2.1.117',
+            'anthropic-beta': 'oauth-2025-04-20',
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            result = json.loads(r.read().decode())
+            result['_cached_at'] = time.time()
+            try:
+                USAGE_CACHE.write_text(json.dumps(result))
+                USAGE_CACHE.chmod(0o600)
+            except Exception:
+                pass
+            return result
+    except Exception:
+        return None
+
+LIVE_REFRESH = 60  # seconds between live refreshes
+
+def cmd_live():
+    print(f"\033[?25l", end='', flush=True)  # hide cursor
+    try:
+        next_fetch = 0.0
+        data = None
+        while True:
+            now = time.time()
+            if now >= next_fetch:
+                fetched = fetch_live_usage_nocache()
+                if fetched:
+                    data = fetched
+                next_fetch = time.time() + LIVE_REFRESH
+
+            print('\033[2J\033[H', end='')  # clear screen, move to top
+            print(f"{BOLD}Claude Code — Live Usage{NC}  {DIM}(Ctrl+C to exit){NC}")
+            print('─' * 54)
+
+            if not data:
+                print(f"\n  {YELLOW}Could not fetch usage data. Retrying...{NC}")
+            else:
+                for key, label in [('five_hour', 'Current session (5h)'), ('seven_day', 'Last 7 days')]:
+                    entry = data.get(key)
+                    if not entry:
+                        continue
+                    pct_used = entry.get('utilization') or 0.0
+                    pct_left = max(0.0, 100.0 - pct_used)
+                    resets = format_reset_time(entry.get('resets_at'))
+                    bar_used = render_bar(pct_used, width=40)
+                    print(f"\n  {BOLD}{label}{NC}")
+                    print(f"  {CYAN}{bar_used}{NC}")
+                    print(f"  {BOLD}{pct_left:.0f}% remaining{NC}  {DIM}({pct_used:.0f}% used){NC}")
+                    if resets:
+                        print(f"  {DIM}{resets}{NC}")
+
+            cached_at = (data or {}).get('_cached_at')
+            if cached_at:
+                updated = datetime.fromtimestamp(cached_at).strftime('%H:%M:%S')
+                secs_ago = int(time.time() - cached_at)
+                print(f"\n  {DIM}Last updated: {updated} ({secs_ago}s ago) — refreshes every {LIVE_REFRESH}s{NC}")
+
+            # countdown refresh
+            deadline = next_fetch
+            while time.time() < deadline:
+                remaining_secs = int(deadline - time.time())
+                print(f"\r  {DIM}Next refresh in {remaining_secs:2d}s...{NC}   ", end='', flush=True)
+                time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print(f"\033[?25h")  # restore cursor
+        print()
+
+def cmd_usage_compact():
+    data = fetch_live_usage()
+    if not data:
+        print('⬡ usage: n/a')
+        return
+    parts = []
+    for key, label in [('five_hour', '5h'), ('seven_day', '7d')]:
+        entry = data.get(key)
+        if not entry:
+            continue
+        pct_used = entry.get('utilization') or 0.0
+        bar = render_bar(pct_used, width=8)
+        parts.append(f'{label} {bar} {pct_used:.0f}%')
+    print('  │  '.join(parts))
+
+def cmd_usage():
+    print(f"\n{BOLD}Claude Code — Usage{NC}")
+    print('─' * 54)
+
+    data = fetch_live_usage()
+    if not data:
+        print(f"{YELLOW}Could not fetch usage data. Make sure you are logged in.{NC}\n")
+        return
+
+    for key, label in [('five_hour', 'Current session'), ('seven_day', 'Last 7 days')]:
+        entry = data.get(key)
+        if not entry:
+            continue
+        pct = entry.get('utilization') or 0.0
+        resets = format_reset_time(entry.get('resets_at'))
+        bar = render_bar(pct)
+        print(f"\n  {BOLD}{label}{NC}")
+        print(f"  {CYAN}{bar}{NC}  {BOLD}{pct:.0f}%{NC} used")
+        if resets:
+            print(f"  {DIM}{resets}{NC}")
+    print()
 
 def save_current_account():
     account = get_current_account()
@@ -409,6 +608,32 @@ def _print_setup_hint(current_email, saved):
         print(f"  {DIM}Tip: run {BOLD}claude-switch save{NC}{DIM} to save the current account.{NC}")
     print()
 
+def cmd_setup_statusline():
+    claude_settings = Path.home() / ".claude" / "settings.json"
+    try:
+        data = json.loads(claude_settings.read_text()) if claude_settings.exists() else {}
+    except Exception:
+        data = {}
+
+    existing = data.get('statusLine', {})
+    if existing.get('command') == 'claude-switch usage --compact':
+        print(f"{YELLOW}Statusline already configured.{NC}")
+        return
+
+    data['statusLine'] = {
+        'type': 'command',
+        'command': 'claude-switch usage --compact',
+        'refreshInterval': 60,
+    }
+
+    claude_settings.parent.mkdir(parents=True, exist_ok=True)
+    tmp = claude_settings.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(data, indent=2) + '\n')
+    tmp.replace(claude_settings)
+
+    print(f"{GREEN}✓ Statusline configured.{NC} Token usage bars will appear below the Claude Code chat.")
+    print(f"{DIM}  Restart Claude Code to apply.{NC}")
+
 def show_help():
     print(f"""
 {BOLD}claude-switch{NC} — Switch between Claude Code accounts without re-authenticating
@@ -417,8 +642,11 @@ def show_help():
   claude-switch                       Switch and launch Claude in this terminal (default)
   claude-switch --new-window          Switch and open Claude in a new terminal window
   claude-switch --no-window           Switch and print the command to run manually
+  claude-switch usage                 Show token usage (current session + last 7 days)
+  claude-switch live                  Live dashboard: barre aggiornate ogni 60s
   claude-switch save                  Save current credentials as a profile
   claude-switch list                  List all saved profiles
+  claude-switch statusline            Add usage bars to Claude Code (run once per machine)
   claude-switch use <email>           Switch non-interactively (launches in this terminal)
   claude-switch use <email> --new-window  Switch and open Claude in a new terminal window
   claude-switch use <email> --no-window   Switch and print the command to run manually
@@ -455,6 +683,15 @@ def main():
         save_current_account()
     elif args[0] == 'list':
         cmd_list()
+    elif args[0] == 'live':
+        cmd_live()
+    elif args[0] == 'statusline':
+        cmd_setup_statusline()
+    elif args[0] == 'usage':
+        if '--compact' in args:
+            cmd_usage_compact()
+        else:
+            cmd_usage()
     elif args[0] == 'use':
         if len(args) < 2:
             print(f"{RED}Usage: claude-switch use <email> [--no-window|--new-window]{NC}")

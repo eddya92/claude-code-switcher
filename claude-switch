@@ -595,24 +595,24 @@ def cmd_setup_statusline():
     except Exception:
         data = {}
 
-    existing = data.get('statusLine', {})
-    if existing.get('command') == 'claude-switch usage --compact':
-        print(f"{YELLOW}Statusline already configured.{NC}")
-        return
-
-    data['statusLine'] = {
+    new_config = {
         'type': 'command',
         'command': 'claude-switch usage --compact',
         'refreshInterval': 60,
     }
+    already = data.get('statusLine') == new_config
+    data['statusLine'] = new_config
 
     claude_settings.parent.mkdir(parents=True, exist_ok=True)
     tmp = claude_settings.with_suffix('.json.tmp')
     tmp.write_text(json.dumps(data, indent=2) + '\n')
     tmp.replace(claude_settings)
 
-    print(f"{GREEN}✓ Statusline configured.{NC} Token usage bars will appear below the Claude Code chat.")
-    print(f"{DIM}  Restart Claude Code to apply.{NC}")
+    if already:
+        print(f"{GREEN}✓ Statusline already up to date.{NC} Token usage bars are active below the Claude Code chat.")
+    else:
+        print(f"{GREEN}✓ Statusline configured.{NC} Token usage bars will appear below the Claude Code chat.")
+        print(f"{DIM}  Restart Claude Code to apply.{NC}")
 
 def show_help():
     print(f"""
